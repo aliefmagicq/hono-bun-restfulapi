@@ -5,17 +5,17 @@ class SendResponse {
     return c.json({
       ok: true,
       statusCode: 201,
-      message: `success: ${message}`,
+      message,
       data: { ...data },
     });
   };
 
-  static error = (c: Context, data: any, e: Error) => {
+  static error = (c: Context, data: any, message: string) => {
     return c.json(
       {
         ok: false,
         statusCode: 500,
-        message: `error: ${e.message}`,
+        message: message,
         data,
       },
       500

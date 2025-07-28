@@ -1,23 +1,33 @@
 import { Context, Hono } from 'hono';
 import { setCookie } from 'hono/cookie';
-import { sign } from 'hono/jwt';
-import { authConfig } from '../config';
+import { sign, verify } from 'hono/jwt';
+import { appConfig, authConfig } from '../config';
 import db from '../lib/db';
 import SendResponse from '../utils/response';
 import AuthMiddleware from './auth.middleware';
-import { findUserByEmail, findUserById } from './auth.service';
+import {
+  findUserByEmail,
+  findUserById,
+  sendEmailVerification,
+} from './auth.service';
+
+type Bindings = {
+  RESEND_API_KEY: string;
+};
 
 class AuthController {
-  public route: Hono;
+  public route: Hono<{ Bindings: Bindings }>;
 
   constructor() {
-    this.route = new Hono();
+    this.route = new Hono<{ Bindings: Bindings }>();
     this.signUp('/sign-up');
     this.signIn('/sign-in');
     this.getUser('/get-user');
+    this.verifyUser('/verify-user');
+    this.verifySuccess('/verification-success');
   }
 
-  signUp = (path: string) => {
+  private signUp = (path: string) => {
     return this.route.post(path, AuthMiddleware.signUp, async (c) => {
       try {
         const body = await c.req.parseBody();
@@ -27,9 +37,11 @@ class AuthController {
           password: body.password as string,
         };
 
+        // FIND USER FIRST
         const findUser = await findUserByEmail(newUser.email);
         if (findUser) throw new Error('email has use by another user');
 
+        // HASH THE PASSWORD & UPDATE THE USERS TABLE
         const hashedPassword = await Bun.password.hash(newUser.password);
         const createUser = await db.users.create({
           data: {
@@ -39,16 +51,36 @@ class AuthController {
           },
         });
 
-        return SendResponse.success(c, createUser, createUser.name);
+        // CREATE VERIFICATION_TOKEN
+        const verificationPayload = {
+          userId: createUser.id,
+          role: createUser.roles,
+          exp: authConfig.verificationEmailSecretExpIn,
+        };
+
+        const verificationToken = await sign(
+          verificationPayload,
+          authConfig.verificationSecret
+        );
+
+        // SEND EMAIL VERIFICATION
+        await sendEmailVerification({
+          c,
+          to: newUser.name,
+          verificationToken,
+          emailToVerify: newUser.email,
+        });
+
+        return SendResponse.success(c, createUser, 'create user success');
       } catch (e) {
         if (e instanceof Error) {
-          return SendResponse.error(c, null, e);
+          return SendResponse.error(c, null, e.message);
         }
       }
     });
   };
 
-  signIn = (path: string) => {
+  private signIn = (path: string) => {
     return this.route.post(path, AuthMiddleware.signIn, async (c) => {
       try {
         const body = await c.req.parseBody();
@@ -57,13 +89,39 @@ class AuthController {
           password: body.password as string,
         };
 
+        // FIND USER FIRST
         const findUser = await findUserByEmail(user.email);
         if (!findUser) throw new Error('no user found');
 
+        // COMPARE TO ALREADY USER PASSWORD
         const comparePassword = {
           success: await Bun.password.verify(user.password, findUser.password),
         };
         if (!comparePassword.success) throw new Error('wrong password!');
+
+        if (!findUser.verifiedEmail) {
+          // CREATE VERIFICATION_TOKEN
+          const verificationPayload = {
+            userId: findUser.id,
+            role: findUser.roles,
+            exp: authConfig.verificationEmailSecretExpIn,
+          };
+
+          const verificationToken = await sign(
+            verificationPayload,
+            authConfig.verificationSecret
+          );
+
+          // SEND EMAIL VERIFICATION
+          await sendEmailVerification({
+            c,
+            to: findUser.name,
+            verificationToken,
+            emailToVerify: findUser.email,
+          });
+
+          return SendResponse.success(c, null, 'email verification success');
+        }
 
         // CREATE ACCESS PAYLOAD
         const accessPayload = {
@@ -112,18 +170,18 @@ class AuthController {
 
         return SendResponse.success(
           c,
-          { email: findUser.email, accessToken },
+          { email: findUser.email },
           'login successfully'
         );
       } catch (e) {
         if (e instanceof Error) {
-          SendResponse.error(c, null, e);
+          SendResponse.error(c, null, e.message);
         }
       }
     });
   };
 
-  getUser = (path: string) => {
+  private getUser = (path: string) => {
     return this.route.get(path, AuthMiddleware.getUser, async (c: Context) => {
       try {
         const userId = c.get('userId');
@@ -143,7 +201,71 @@ class AuthController {
         return SendResponse.success(c, user, 'success get user');
       } catch (e) {
         if (e instanceof Error) {
-          SendResponse.error(c, null, e);
+          SendResponse.error(c, null, e.message);
+        }
+      }
+    });
+  };
+
+  private verifyUser = (path: string) => {
+    return this.route.get(path, async (c) => {
+      try {
+        // GET TOKEN FROM QUERYPARAMS
+        const { token, email } = c.req.query();
+        // FIND USER FIRST
+        const findUser = await findUserByEmail(email);
+        if (!findUser) throw new Error('user not found');
+
+        // DECODED TOKEN
+        const decodedToken = await verify(token, authConfig.verificationSecret);
+        if (decodedToken && decodedToken.exp) {
+          // IF TOKEN IS < THAN DATA NOW
+          if (decodedToken.exp < Date.now()) {
+            throw new Error('token has expired');
+          }
+
+          // UPDATE USER TABLE
+          await db.users.update({
+            where: { id: findUser.id },
+            data: { verifiedEmail: true },
+          });
+
+          // REDIRECT TO SIGN IN PAGE
+          return c.redirect(
+            `http://${appConfig.host}:${appConfig.port}/api/auth/verification-success?token=${token}`,
+            301
+          );
+        }
+      } catch (e) {
+        if (e instanceof Error) {
+          return SendResponse.error(c, null, e.message);
+        }
+      }
+    });
+  };
+
+  // SHOULD BE PROTECT BY MIDDLEWARE MAYBE allip
+  private verifySuccess = (path: string) => {
+    return this.route.get(path, async (c) => {
+      try {
+        // GET TOKEN FROM QUERY PARAMS
+        const { token } = c.req.query();
+        if (!token) {
+          throw new Error('you not authorized to access this resource');
+        }
+
+        // DECODED TOKEN AND VALIDATE
+        const decodedToken = await verify(token, authConfig.verificationSecret);
+        if (decodedToken && decodedToken.exp) {
+          if (decodedToken.exp < Date.now()) {
+            throw new Error('you not authorized to access this resource');
+          }
+
+          return SendResponse.success(c, null, 'verification-success');
+        }
+      } catch (e) {
+        if (e instanceof Error) {
+          return SendResponse.error(c, null, e.message);
         }
       }
     });
