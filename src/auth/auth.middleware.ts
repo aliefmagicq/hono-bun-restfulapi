@@ -10,7 +10,6 @@ class AuthMiddleware {
     try {
       const body = await c.req.parseBody();
       const isValid = signUpSchema.safeParse({ ...body });
-
       if (!isValid.success) {
         throw new Error('Please complete your personal details.');
       }
@@ -18,7 +17,7 @@ class AuthMiddleware {
       await next();
     } catch (e) {
       if (e instanceof Error) {
-        return SendResponse.error(c, null, e);
+        return SendResponse.error(c, null, e.message);
       }
     }
   };
@@ -27,7 +26,6 @@ class AuthMiddleware {
     try {
       const body = await c.req.parseBody();
       const isValid = signInSchema.safeParse({ ...body });
-
       if (!isValid.success) {
         throw new Error('Please complete your personal details.');
       }
@@ -35,7 +33,7 @@ class AuthMiddleware {
       await next();
     } catch (e) {
       if (e instanceof Error) {
-        return SendResponse.error(c, null, e);
+        return SendResponse.error(c, null, e.message);
       }
     }
   };
@@ -43,8 +41,6 @@ class AuthMiddleware {
   static getUser = async (c: Context, next: Next) => {
     try {
       const cookie = getCookie(c, 'access_token');
-      const refreshCookie = getCookie(c, 'refresh_token');
-
       if (!cookie || cookie === undefined) throw new Error('user not found');
 
       const decodedToken = await verify(cookie, authConfig.secret);
@@ -57,7 +53,7 @@ class AuthMiddleware {
       await next();
     } catch (e) {
       if (e instanceof Error) {
-        return SendResponse.error(c, null, e);
+        return SendResponse.error(c, null, e.message);
       }
     }
   };
